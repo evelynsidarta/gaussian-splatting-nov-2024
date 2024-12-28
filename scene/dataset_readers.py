@@ -309,7 +309,101 @@ def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"
                            is_nerf_synthetic=True)
     return scene_info
 
+def readCamerasFromCustomBlenderTransforms(path, transformsfile, depths_folder, white_background, is_test=False, extension=".png"):
+    cam_infos = []
+
+    with open(os.path.join(path, transformsfile)) as json_file:
+        cam_datas = json.load(json_file)
+
+
+        for idx, cam_data in enumerate(cam_datas):
+            # if is_test==False:
+            cam_name = os.path.join(path, "./train/image" + str(idx)+ "0020" + extension)
+            # else:
+                # cam_name = os.path.join(path, "./test/image" + str(idx) + extension)
+
+            # NeRF 'transform_matrix' is a camera-to-world transform
+            c2w = np.array(cam_data["transform_matrix"])
+            # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
+            c2w[:3, 1:3] *= -1
+
+            # get the world-to-camera transform and set R, T
+            w2c = np.linalg.inv(c2w)
+            R = np.transpose(w2c[:3, :3])  # R is stored transposed due to 'glm' in CUDA code
+            T = w2c[:3, 3]
+
+            image_path = os.path.join(path, cam_name)
+            image_name = Path(cam_name).stem
+            image = Image.open(image_path)
+
+            im_data = np.array(image.convert("RGBA"))
+
+            bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
+
+            norm_data = im_data / 255.0
+            arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+            image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
+
+            fovx = cam_data["camera_angle_x"]
+            fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
+            FovY = fovy
+            FovX = fovx
+
+            depth_path = os.path.join(depths_folder, f"{image_name}.png") if depths_folder != "" else ""
+
+            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX,
+                                        image_path=image_path, image_name=image_name,
+                                        width=image.size[0], height=image.size[1], depth_path=depth_path, depth_params=None, is_test=is_test))
+
+    return cam_infos
+
+
+def readCustomBlenderDataInfo(path, white_background, depths, eval, extension=".png"):
+
+    depths_folder = os.path.join(path, depths) if depths != "" else ""
+    print("Reading Training Transforms")
+    train_cam_infos = readCamerasFromCustomBlenderTransforms(path, "transforms_train.json", depths_folder, white_background, False, extension)
+    # print("Reading Test Transforms")
+    # test_cam_infos = readCamerasFromCustomBlenderTransforms(path, "transforms_test.json", depths_folder, white_background, True, extension)
+
+    # if not eval:
+    #     train_cam_infos.extend(test_cam_infos)
+    test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(path, "points3d.ply")
+    # Since this data set has no colmap data, we start with random points
+    num_pts = 100_000
+    print(f"Generating random point cloud ({num_pts})...")
+
+    # We create random points inside the bounds of the synthetic Blender scenes
+    # xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+    # scale = np.array([4, 9, 2])
+    # translation = -scale * 0.5
+    scale = np.array([1, 1, 1])
+    translation = -scale * 0.5
+    xyz = np.random.random((num_pts, 3)) * scale + translation
+    shs = np.random.random((num_pts, 3)) / 255.0
+    pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+
+    storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path,
+                           is_nerf_synthetic=True)
+    return scene_info
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    # "Blender" : readNerfSyntheticInfo,
+    "Blender" : readCustomBlenderDataInfo,
+
 }
